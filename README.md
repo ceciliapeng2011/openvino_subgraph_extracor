@@ -15,8 +15,5 @@ make
 ov_model_splitter <model path> <start end> <end node>
 ```
 # Limitation
-Currently, this tool only supports single input/output from command line, but you can specify multiple inputs/outputs inside the source code at L47-L48
-```
-    std::vector<std::string> target_input = {argv[2]};
-    std::vector<std::string> target_output = {argv[3]};
+This tool support cut from more than one inputs or outputs from command line. But you need make sure all of them are working as a whole without any branch leaving outside of the subgraph.
 ```

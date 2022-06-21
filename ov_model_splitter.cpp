@@ -89,57 +89,106 @@ int main(int args, char *argv[]) {
     for(auto& op : ordered_ops) {
         name2op.emplace(op->get_friendly_name(), op);
     }
-    std::vector<std::string> target_input = {"dien/rnn_2/gru2/concat_2", "dien/rnn_2/gru2/sub_2"};
-    std::vector<std::string> target_output = {"dien/rnn_2/gru2/add_1"};
+
+    // These target inputs and outputs are tensors.
+    std::vector<std::string> target_inputs = {
+            "dien/rnn_2/gru2/add:0", 
+            "dien/rnn_1/gru1/GRUBlockCell_1/GRUBlockCell:0", "dien/rnn_2/gru2/strided_slice_2/Squeeze_shrink:0",
+            "dien/rnn_1/gru1/GRUBlockCell_2/GRUBlockCell:0", "dien/rnn_2/gru2/strided_slice_3/Squeeze_shrink:0"
+        };
+    std::vector<std::string> target_outputs = {"dien/rnn_2/gru2/add_2:0"};
 
     std::vector<std::shared_ptr<opset8::Parameter> > subgraph_parameters = {};
     std::vector<std::shared_ptr<opset8::Result> > subgraph_results = {};
 
-    for(auto& input_name : target_input) {
-        auto input_op = name2op.at(input_name);
-        if (auto node = ov::as_type_ptr<opset8::Parameter>(input_op)) {
-            std::cout << "keep original parameter " << input_name << std::endl;
-            subgraph_parameters.push_back(node);
-            continue;
+    auto get_op_name_port = [](std::string& tensor_name) -> std::tuple<std::string, int64_t> {
+        const auto pos = tensor_name.find_last_of(":");
+        if (pos == std::string::npos) {
+            std::cout << "warning, not a tensor name, skip." << std::endl;
+            return std::make_tuple(std::string(), -1);
+        }
+        const auto op_name = tensor_name.substr(0, pos-0);
+        const auto port_name = tensor_name.substr(pos+1);
+        const auto port_id = std::stoi(port_name);
+        std::cout << "target : " << tensor_name << ", op " << op_name << ", port " << port_id << std::endl;
+        return std::make_tuple(op_name, port_id);
+    };
+
+    for (auto& input_tensor : target_inputs) {
+        std::string op_name;
+        int64_t port_id;
+        std::tie(op_name, port_id) = get_op_name_port(input_tensor);
+        if (op_name.empty() || port_id == -1) continue;
+
+        auto input_op = name2op.at(op_name);
+        if (input_op->get_output_tensor(port_id).get_names().size() < 1) {
+            input_op->get_output_tensor(port_id).add_names({input_tensor});
         }
 
-        for(size_t i = 0; i < input_op->get_input_size(); i++) {
-            auto parent = input_op->get_input_node_shared_ptr(i);
-            if(ov::as_type_ptr<ov::opset8::Constant>(parent)) {
-                continue;
-            }
+        if (const auto node = ov::as_type_ptr<opset8::Parameter>(input_op)) {
+            std::cout << "keep original parameter " << op_name << std::endl;
+            subgraph_parameters.push_back(node);
+        } else {
+            auto output = input_op->output(port_id);
+
             // each non-constant inputs will be replaced by a Parameter node.
-            auto new_param = std::make_shared<opset8::Parameter>(input_op->get_input_element_type(i),
-                                                                input_op->get_input_partial_shape(i));
-            const auto new_name = input_name+"/"+std::to_string(i);                                                                
+            auto new_param = std::make_shared<opset8::Parameter>(output.get_element_type(),
+                                                                output.get_partial_shape());
+            const auto new_name = input_tensor;
             new_param->set_friendly_name(new_name);
             new_param->get_output_tensor(0).add_names({new_name});
 
-            subgraph_parameters.push_back(new_param);
-
-            for (auto child : parent->outputs()) {
-                for (auto &input : child.get_target_inputs()) {
-                    input.replace_source_output(new_param);
-                }
+            for (auto &input : output.get_target_inputs()) {
+                input.replace_source_output(new_param);
             }
-            //input_op->input_value(i).replace(new_param->output(i));            
+
+            subgraph_parameters.push_back(new_param);            
         }
     }
+
     model->add_parameters(subgraph_parameters);
     model->validate_nodes_and_infer_types();
     std::cout << __LINE__ << ": model nodes " << model->get_ops().size() << ", parameter " << model->get_parameters().size() << ", results " << model->get_results().size() << std::endl;
 
-    for(auto& output_name : target_output) {
-        auto output_op = name2op.at(output_name);
-        if (output_op->get_output_size() !=1) {
-            throw std::runtime_error("output must has 1 child");
+    for(auto& output_tensor : target_outputs) {
+        std::string op_name;
+        int64_t port_id;
+        std::tie(op_name, port_id) = get_op_name_port(output_tensor);
+        if (op_name.empty() || port_id == -1) continue;
+
+        auto output_op = name2op.at(op_name);
+        std::cout << "tensor port "<<  port_id << ": " << output_op->get_output_tensor(port_id).get_any_name() << std::endl;
+
+        if (const auto node = ov::as_type_ptr<opset8::Result>(output_op)) {
+            std::cout << "keep original Result " << op_name << std::endl;
+            subgraph_results.push_back(node);
+        } else {
+            std::shared_ptr<opset8::Result> new_res;
+            if (output_op->get_output_size() == 1) {
+                auto node_copy = output_op->clone_with_new_inputs(output_op->input_values());
+                new_res = std::make_shared<opset8::Result>(node_copy);
+                ov::replace_node(output_op, new_res);
+            } else {
+                auto output = output_op->output(port_id);
+
+                // each non-constant inputs will be replaced by a Parameter node.
+                new_res = std::make_shared<opset8::Result>(output);
+                const auto new_name = output_tensor;
+                new_res->set_friendly_name(new_name);
+                new_res->get_output_tensor(0).add_names({new_name});
+
+                for (auto &input : output.get_target_inputs()) {
+                    input.replace_source_output(new_res);
+                }                
+            }
+
+            subgraph_results.push_back(new_res);
         }
-        auto node_copy = output_op->clone_with_new_inputs(output_op->input_values());
-        auto new_result = std::make_shared<opset8::Result>(node_copy);
-        ov::replace_node(output_op, new_result);
-        subgraph_results.push_back(new_result);
     }
+    std::cout << __LINE__ << std::endl;
     model->add_results(subgraph_results);
+    //model->validate_nodes_and_infer_types();
+    std::cout << __LINE__ << ": model nodes " << model->get_ops().size() << ", parameter " << model->get_parameters().size() << ", results " << model->get_results().size() << std::endl;
 
     /* remove the original parameters... otherwise exeption that they are not registered. */
     const auto parameters = model->get_parameters();
